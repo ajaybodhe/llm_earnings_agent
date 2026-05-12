@@ -2,25 +2,38 @@
 
 Two-stage fallback chain:
 
-1. **Alpha Vantage** — primary. Free tier, 25 req/day at 1 req/sec.
-       https://www.alphavantage.co/query?function=EARNINGS_CALL_TRANSCRIPT&symbol=&quarter=&apikey=
-       Quarter format `YYYYQN`. Walk-back from the most recent completed
-       calendar quarter up to `max_lookback_quarters`, throttled to ~1 req/sec.
-       A quota advisory aborts the walk-back immediately. Negative results are
-       persisted to a disk cache (`NEGATIVE_CACHE_PATH`) with a 7-day TTL so
-       repeat runs don't burn quota on quarters we already know are empty.
+1. **Financial Modeling Prep** — primary. Paid endpoint.
+       https://financialmodelingprep.com/stable/earning-call-transcript?symbol=&quarter=&year=&apikey=
+       (The legacy /api/v3 endpoint was deprecated Aug 31, 2025 and now
+       returns a "Legacy Endpoint" error to non-grandfathered keys.)
+       Walk-back from the most recent completed calendar quarter up to
+       `max_lookback_quarters`, throttled to a polite ~0.25s between calls.
+       Negative results (HTTP 200 with empty array) are persisted to a disk
+       cache (`NEGATIVE_CACHE_PATH`) with a 7-day TTL so repeat runs don't
+       re-walk known-empty quarters.
 
-2. **SEC EDGAR 8-K Item 2.02 exhibits** — fallback. Free, no rate limit.
-       Companies attach earnings-release exhibits to their results 8-K. Some
-       (mostly mid/large caps) attach the analyst-call prepared remarks as a
-       separate exhibit (EX-99.2 or similar). We fetch the most recent 8-K
-       with Item 2.02, list its exhibits, and accept any HTML/text exhibit
-       that looks transcript-shaped (long + multi-speaker + Q&A markers).
-       Coverage is partial (~30-40% of large caps) but the data is free and
-       complementary to AV — different misses, different hits.
+       Plan/auth errors (401/402/403 or "Error Message" body indicating
+       subscription gating) raise `FMPPlanError`, abort the walk-back, and
+       fall through to SEC EDGAR. The same key works once the FMP plan is
+       upgraded to include the transcript endpoint — no code change needed.
 
-History: FMP's free tier 403's the transcript endpoint and API Ninjas 400's
-on most US tickers — both were removed as they contributed only log noise.
+2. **SEC EDGAR earnings filings** — fallback. Free, no rate limit. Accepts
+   both 8-K Item 2.02 (domestic filers) and 6-K (foreign private issuers).
+       Two-tier extraction within a single scan:
+         a. Look for transcript-shaped exhibits (long + multi-speaker + Q&A
+            markers — EX-99.2 / named-"transcript" / etc.). Empirically <10%
+            of S&P 500 attach prepared remarks; when present, returned as
+            `Transcript(kind="transcript")`.
+         b. If no transcript exhibit is found in the lookback window, return
+            the most recent earnings press release (EX-99.1 from the most
+            recent Item 2.02 8-K) as `Transcript(kind="press_release")`. The
+            transcript agent recognises this kind and caps confidence
+            accordingly — it has revenue/EPS/guidance text but no Q&A tone.
+       100% of S&P 500 attach a press release, so this gives the transcript
+       agent *some* signal for every ticker rather than null.
+
+History: Alpha Vantage (free 25/day) and API Ninjas / FMP-free were all
+tried and removed — quota too tight or endpoints behind paid gates anyway.
 """
 
 from __future__ import annotations
@@ -33,6 +46,9 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+TranscriptKind = Literal["transcript", "press_release"]
 
 import httpx
 
@@ -40,8 +56,8 @@ from .events import SUBMISSIONS_URL, _resolve_cik, _user_agent
 
 logger = logging.getLogger(__name__)
 
-ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
-ALPHA_VANTAGE_DEFAULT_KEY = "VSDK9FRT62RNF27R"
+FMP_BASE_URL = "https://financialmodelingprep.com/stable/earning-call-transcript"
+FMP_DEFAULT_KEY = "vNrb9krkhGhldJ8Z1Ij21G5239wwsAUU"
 
 # SEC EDGAR archives use the bare integer CIK and the dashless accession in
 # the path. `index.json` lists files in the filing.
@@ -60,14 +76,15 @@ SEC_LOOKBACK_DAYS = 120
 SEC_TRANSCRIPT_MIN_CHARS = 8_000  # press releases are typically 3–6KB
 SEC_TRANSCRIPT_MIN_SPEAKERS = 3
 
-# AV's free-tier hint is "1 request per second". Wait a hair more between
-# walk-back iterations so we don't accidentally trip the burst limit.
-WALKBACK_REQUEST_DELAY_S = 1.1
+# FMP's paid tiers allow hundreds of req/min, but a small inter-call gap is
+# good citizenship and keeps the walk-back from hammering when a ticker has
+# many empty quarters in a row.
+WALKBACK_REQUEST_DELAY_S = 0.25
 
-# Disk-backed cache of (symbol, quarter, year) tuples that Alpha Vantage has
-# confirmed empty. Walk-back skips any quarter in here, which conserves the
-# 25/day free-tier quota across repeated runs. Entries expire after
-# NEGATIVE_CACHE_TTL_DAYS so a delayed-posting transcript can still be found.
+# Disk-backed cache of (symbol, quarter, year) tuples that FMP has confirmed
+# empty. Walk-back skips any quarter in here, which avoids paying for repeat
+# negative lookups across runs. Entries expire after NEGATIVE_CACHE_TTL_DAYS
+# so a delayed-posting transcript can still be found.
 NEGATIVE_CACHE_PATH = (
     Path(__file__).resolve().parents[3] / "data" / "cache" / "transcript_negative.json"
 )
@@ -80,16 +97,22 @@ class Transcript:
     quarter: int  # 1..4
     year: int
     content: str
+    # `transcript` = full prepared remarks + Q&A (AV, FMP, SEC named-transcript exhibit).
+    # `press_release` = SEC EX-99.1 fallback when no full transcript is available.
+    # Downstream prompt caps confidence on `press_release` since it lacks Q&A
+    # tone and analyst pushback that drive most of the agent's signal.
+    kind: TranscriptKind = "transcript"
 
     @property
     def label(self) -> str:
         return f"Q{self.quarter} {self.year}"
 
 
-class AlphaVantageQuotaError(RuntimeError):
-    """Raised when Alpha Vantage returns an advisory ('Information' / 'Note').
-    Subsequent calls in the same minute / day will hit the same response, so
-    callers should stop walking back and surface the condition once."""
+class FMPPlanError(RuntimeError):
+    """Raised when FMP returns a plan/auth error (401/402/403, or HTTP 200
+    with an "Error Message" body indicating subscription gating). Subsequent
+    calls in the same run will hit the same response, so callers should stop
+    walking back and surface the condition once."""
 
 
 def _quarter_end(quarter: int, year: int) -> _dt.date:
@@ -105,63 +128,76 @@ def _is_completed_quarter(quarter: int, year: int, today: _dt.date) -> bool:
     return _quarter_end(quarter, year) <= today
 
 
-async def _alpha_vantage_fetch(
+_FMP_PLAN_MSG_PAT = re.compile(
+    r"legacy|subscription|upgrade|restricted endpoint|premium|not available under",
+    re.IGNORECASE,
+)
+
+
+async def _fmp_fetch(
     symbol: str, quarter: int, year: int, *, client: httpx.AsyncClient, token: str
 ) -> Transcript | None:
-    """Fetch from Alpha Vantage. Response shape:
-        {"symbol": "...", "quarter": "2026Q1",
-         "transcript": [{"speaker": "...", "title": "...", "content": "...", ...}, ...]}
+    """Fetch from FMP's `/stable/earning-call-transcript`. Response shape:
+        [{"symbol":"AMD","quarter":1,"year":2026,"date":"2026-05-05 17:00:00","content":"Operator..."}]
 
-    Raises `AlphaVantageQuotaError` on advisory responses (rate-limit / daily
-    cap) — the walk-back should bail. Returns None for any other failure mode
-    (no data for this quarter, 4xx, network error) so the walk-back can try an
-    older quarter."""
+    Raises `FMPPlanError` when the key/plan can't access the endpoint
+    (401/402/403, or HTTP 200 with an "Error Message" body) — the walk-back
+    should bail. Returns None for any other miss (no data for this quarter,
+    network error) so the walk-back can try an older quarter."""
     params = {
-        "function": "EARNINGS_CALL_TRANSCRIPT",
         "symbol": symbol.upper(),
-        "quarter": f"{year}Q{quarter}",
+        "quarter": quarter,
+        "year": year,
         "apikey": token,
     }
     try:
-        resp = await client.get(ALPHA_VANTAGE_BASE_URL, params=params)
+        resp = await client.get(FMP_BASE_URL, params=params)
+        if resp.status_code in (401, 402, 403):
+            raise FMPPlanError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
         payload = resp.json()
+    except FMPPlanError:
+        raise
     except httpx.HTTPStatusError as e:
         logger.warning(
-            "AlphaVantage transcript %s Q%d %d returned %d",
+            "FMP transcript %s Q%d %d returned %d",
             symbol, quarter, year, e.response.status_code,
         )
         return None
     except httpx.HTTPError as e:
         logger.warning(
-            "AlphaVantage transcript %s Q%d %d network error: %s", symbol, quarter, year, e
+            "FMP transcript %s Q%d %d network error: %s", symbol, quarter, year, e
+        )
+        return None
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(
+            "FMP transcript %s Q%d %d response was not valid JSON: %s", symbol, quarter, year, e
         )
         return None
 
-    if not isinstance(payload, dict):
+    # FMP sometimes returns 200 with a plan/auth error in the body rather than a 4xx.
+    if isinstance(payload, dict):
+        err = payload.get("Error Message") or payload.get("error") or ""
+        if isinstance(err, str) and _FMP_PLAN_MSG_PAT.search(err):
+            raise FMPPlanError(err)
         return None
-    if "Information" in payload or "Note" in payload:
-        raise AlphaVantageQuotaError(payload.get("Information") or payload.get("Note"))
-    turns = payload.get("transcript") or []
-    if not isinstance(turns, list) or not turns:
+    if not isinstance(payload, list) or not payload:
         return None
-    parts: list[str] = []
-    for t in turns:
-        if not isinstance(t, dict):
-            continue
-        speaker = (t.get("speaker") or "").strip()
-        title = (t.get("title") or "").strip()
-        content = (t.get("content") or "").strip()
-        if not content:
-            continue
-        header = speaker if not title else f"{speaker} ({title})" if speaker else title
-        parts.append(f"[{header}]: {content}" if header else content)
-    text = "\n\n".join(parts)
-    if not text:
+    entry = payload[0]
+    if not isinstance(entry, dict):
         return None
-    return Transcript(symbol=symbol.upper(), quarter=quarter, year=year, content=text)
+    content = (entry.get("content") or "").strip()
+    if not content:
+        return None
+    # Trust the entry's own quarter/year when present; fall back to the request params.
+    try:
+        q = int(entry.get("quarter", quarter))
+        y = int(entry.get("year", year))
+    except (TypeError, ValueError):
+        q, y = quarter, year
+    return Transcript(symbol=symbol.upper(), quarter=q, year=y, content=content)
 
 
 def _neg_cache_key(symbol: str, quarter: int, year: int) -> str:
@@ -206,9 +242,9 @@ def _record_empty(
 
 
 def _resolve_token() -> str:
-    token = os.environ.get("ALPHAVANTAGE_API_KEY", "") or ALPHA_VANTAGE_DEFAULT_KEY
+    token = os.environ.get("FMP_API_KEY", "") or FMP_DEFAULT_KEY
     if not token:
-        raise RuntimeError("ALPHAVANTAGE_API_KEY env var must be set")
+        raise RuntimeError("FMP_API_KEY env var must be set")
     return token
 
 
@@ -271,11 +307,43 @@ def _quarter_from_report_date(report_date: _dt.date) -> tuple[int, int]:
     return q, report_date.year
 
 
+def _earnings_quarter_for_filing(
+    form_type: str, filed_date: _dt.date, report_date: str
+) -> tuple[int, int]:
+    """Resolve (quarter, year) for an earnings filing.
+
+    For 8-K Item 2.02, `reportDate` is the fiscal period-end (e.g. 2026-03-31
+    for a Q1 2026 release filed 2026-05-01) — use it directly.
+
+    For 6-K (foreign filers), SEC's `reportDate` is almost always equal to
+    the filing date rather than the period-end. Earnings releases typically
+    land 30-60 days after the quarter closes, so we subtract ~45 days from
+    the filing date to land back inside the reporting quarter. Without this,
+    a Q1 2026 NBIS release filed on 2026-05-01 would be labeled Q2 2026."""
+    if form_type == "6-K":
+        # Filing date back-dated 45 days to land in the reported quarter.
+        rep = filed_date - _dt.timedelta(days=45)
+        return _quarter_from_report_date(rep)
+    try:
+        rep = _dt.date.fromisoformat(report_date) if report_date else filed_date
+    except ValueError:
+        rep = filed_date
+    return _quarter_from_report_date(rep)
+
+
 # EDGAR filings ship with a lot of boilerplate alongside the actual exhibits:
 # rendering files generated for the Inline XBRL viewer, the auto-generated
 # index pages, and the form itself. Only Ex-99.* and named "transcript"/
 # "remarks"/"call" files are realistic transcript candidates.
-_EX99_PAT = re.compile(r"ex[_\-]?99", re.IGNORECASE)
+#
+# Exhibit-99 naming varies wildly across filers:
+#   • `ex-99.1.htm`, `ex991.htm`            ← standard
+#   • `a8-kex991q2202603282026.htm`         ← Apple-style, "ex99" glued mid-name
+#   • `q12026991.htm`                       ← AMD-style, no "ex" prefix at all
+# So the regex matches EITHER an explicit `ex99` token OR `99N` immediately
+# followed by a separator/extension (.htm, _, -). The trailing class avoids
+# spurious matches on years like 1999 inside random text.
+_EX99_PAT = re.compile(r"(?:ex[_\-]?99|99[12349](?:\.|[_\-]|$))", re.IGNORECASE)
 _NAMED_TRANSCRIPT_PAT = re.compile(r"transcript|remarks|earningscall|call[_\-]?script", re.IGNORECASE)
 _JUNK_FILE_PAT = re.compile(
     r"(?:"
@@ -297,14 +365,20 @@ def _is_candidate_exhibit(name: str) -> bool:
     return bool(_EX99_PAT.search(name) or _NAMED_TRANSCRIPT_PAT.search(name))
 
 
+_EX991_PAT = re.compile(
+    r"(?:ex[_\-]?99[_\-.]?1\b|991(?:\.|[_\-]|$))", re.IGNORECASE
+)
+
+
 def _exhibit_sort_key(name: str) -> tuple[int, str]:
     """Order: named-transcript files first, then ex-99.2/3/... before ex-99.1
-    (since ex-99.1 is almost always the press release). Lower tuple sorts first."""
+    (since ex-99.1 is almost always the press release). Lower tuple sorts first.
+
+    Matches both `ex-99.1` and `<period>991` (AMD-style) for the EX-99.1 bias."""
     lower = name.lower()
     if _NAMED_TRANSCRIPT_PAT.search(lower):
         return (0, lower)
-    # Bias against ex-99.1 (typically press release) by sorting after the rest.
-    if re.search(r"ex[_\-]?99[_\-.]?1\b", lower):
+    if _EX991_PAT.search(lower):
         return (2, lower)
     return (1, lower)
 
@@ -358,15 +432,55 @@ async def _sec_fetch_exhibit_text(
     return _WHITESPACE_RE.sub(" ", decoded).strip()
 
 
+# Minimum length for an exhibit to be considered a real press release rather
+# than a stub or fragment. Typical earnings press releases are 4-15 KB of
+# text after HTML stripping; below 2 KB it's almost certainly boilerplate or
+# a navigation artifact.
+SEC_PRESS_RELEASE_MIN_CHARS = 2_000
+
+
+# 6-K filings cover all foreign-filer material events — earnings, acquisitions,
+# board changes, regulatory filings, partnership announcements, etc. We accept
+# the 6-K as a candidate filing but only stash its exhibit as a press release
+# if the content actually looks like earnings. 8-K Item 2.02 is already gated
+# upstream so this filter is skipped for 8-K.
+_EARNINGS_INDICATOR_PAT = re.compile(
+    r"(?:"
+    r"reports?\s+(?:first|second|third|fourth)\s+quarter"
+    r"|(?:first|second|third|fourth)\s+quarter\s+(?:and\s+full[\s\-]year|\d{4}\s+(?:financial\s+)?results)"
+    r"|reports?\s+(?:fiscal|fy)\s+\d{4}"
+    r"|quarterly\s+earnings\s+(?:release|results)"
+    r"|q[1-4]\s+\d{4}\s+(?:financial\s+)?results"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_earnings_press_release(text: str) -> bool:
+    """True when the exhibit text contains an unambiguous earnings header
+    pattern (e.g. "reports fourth quarter", "Q1 2026 financial results"),
+    used to filter 6-K filings that are acquisitions, partnerships, or other
+    non-earnings material events."""
+    return (
+        len(text) >= SEC_PRESS_RELEASE_MIN_CHARS
+        and _EARNINGS_INDICATOR_PAT.search(text) is not None
+    )
+
+
 async def _sec_extract_transcript(
     symbol: str, *, client: httpx.AsyncClient, today: _dt.date
 ) -> Transcript | None:
     """Scan recent Item 2.02 8-K filings for a transcript-shaped exhibit.
 
-    Walks the symbol's recent filings list, filters to earnings 8-Ks within
-    `SEC_LOOKBACK_DAYS`, and for each candidate downloads each non-trivial
-    exhibit until one passes the `_looks_like_transcript` heuristic.
-    Returns `None` when no filing yields a transcript-shaped exhibit."""
+    Walks the symbol's recent filings list, filters to earnings filings
+    within `SEC_LOOKBACK_DAYS`. Accepts both **8-K with Item 2.02** (domestic
+    filers) AND **6-K** (foreign private issuers like NBIS / Nebius / ASML
+    which never file 8-Ks). For each candidate, downloads each non-trivial
+    exhibit and returns the first one that passes `_looks_like_transcript`
+    as a full transcript. If no exhibit clears that bar, returns the first
+    press-release-shaped exhibit encountered (most recent filing's EX-99.1)
+    as `kind="press_release"`. Returns `None` only if the symbol has no
+    qualifying filing in the window at all."""
     cik = await _resolve_cik(symbol, client)
     if not cik:
         return None
@@ -389,12 +503,19 @@ async def _sec_extract_transcript(
     report_dates = recent.get("reportDate") or []
 
     cutoff = today - _dt.timedelta(days=SEC_LOOKBACK_DAYS)
-    candidates: list[tuple[_dt.date, str, str, str]] = []  # (filed, accession, primary, reportDate)
+    # (filed_date, accession, primary, reportDate, form_type)
+    candidates: list[tuple[_dt.date, str, str, str, str]] = []
     for i, form in enumerate(forms):
-        if not form or not form.startswith("8-K"):
+        if not form:
             continue
         items_str = items_col[i] if i < len(items_col) else ""
-        if "2.02" not in items_str:
+        # 8-K with Item 2.02 = domestic-filer earnings release.
+        # 6-K = foreign-private-issuer earnings (no Items field is reliably
+        # populated for 6-K; the press-release content filter naturally
+        # rejects non-earnings 6-Ks like shareholder votes).
+        is_earnings_8k = form.startswith("8-K") and "2.02" in items_str
+        is_6k = form == "6-K"
+        if not (is_earnings_8k or is_6k):
             continue
         try:
             d = _dt.date.fromisoformat(filed[i])
@@ -408,12 +529,17 @@ async def _sec_extract_transcript(
                 accs[i] if i < len(accs) else "",
                 primary[i] if i < len(primary) else "",
                 report_dates[i] if i < len(report_dates) else "",
+                form,
             )
         )
     # Most recent first.
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    for filed_date, accession, _primary, report_date in candidates:
+    # Captured during the scan: the first press-release-shaped exhibit we
+    # encounter. Falls back to this when no transcript is found.
+    press_release_fallback: Transcript | None = None
+
+    for filed_date, accession, _primary, report_date, form_type in candidates:
         if not accession:
             continue
         items = await _sec_fetch_8k_index(cik, accession, client=client)
@@ -429,20 +555,46 @@ async def _sec_extract_transcript(
         # transcript / remarks / call — those are the ones most likely to be
         # the actual transcript when a company attaches one.
         exhibits.sort(key=_exhibit_sort_key)
+        q, y = _earnings_quarter_for_filing(form_type, filed_date, report_date)
         for name in exhibits:
             text = await _sec_fetch_exhibit_text(cik, accession, name, client=client)
-            if text and _looks_like_transcript(text):
-                try:
-                    rep = _dt.date.fromisoformat(report_date) if report_date else filed_date
-                except ValueError:
-                    rep = filed_date
-                q, y = _quarter_from_report_date(rep)
+            if not text:
+                continue
+            if _looks_like_transcript(text):
                 logger.info(
                     "SEC transcript hit: %s %s exhibit %s (filed %s)",
                     symbol, accession, name, filed_date,
                 )
-                return Transcript(symbol=symbol.upper(), quarter=q, year=y, content=text)
-    return None
+                return Transcript(
+                    symbol=symbol.upper(), quarter=q, year=y,
+                    content=text, kind="transcript",
+                )
+            # Only stash the FIRST press-release candidate (from the most
+            # recent qualifying filing). For 8-K Item 2.02, the item tag
+            # already guarantees this is earnings content. For 6-K, we
+            # additionally require the text itself to look like earnings
+            # (so we skip acquisition / partnership / governance 6-Ks).
+            if press_release_fallback is not None:
+                continue
+            if form_type.startswith("8-K"):
+                qualifies = len(text) >= SEC_PRESS_RELEASE_MIN_CHARS
+            else:
+                qualifies = _looks_like_earnings_press_release(text)
+            if qualifies:
+                press_release_fallback = Transcript(
+                    symbol=symbol.upper(), quarter=q, year=y,
+                    content=text, kind="press_release",
+                )
+                logger.info(
+                    "SEC press-release stash: %s %s exhibit %s (filed %s)",
+                    symbol, accession, name, filed_date,
+                )
+    if press_release_fallback is not None:
+        logger.info(
+            "SEC press-release fallback: %s Q%d %d (no full transcript found)",
+            symbol, press_release_fallback.quarter, press_release_fallback.year,
+        )
+    return press_release_fallback
 
 
 async def fetch_transcript(
@@ -454,9 +606,9 @@ async def fetch_transcript(
     timeout_s: float = 30.0,
     today: _dt.date | None = None,
 ) -> Transcript | None:
-    """Fetch a single quarter's transcript. Returns None if not available.
+    """Fetch a single quarter's transcript via FMP. Returns None if not available.
 
-    Future / in-progress quarters short-circuit to None — Alpha Vantage has no
+    Future / in-progress quarters short-circuit to None — FMP has no
     transcript for a quarter that hasn't ended yet."""
     today = today or _dt.date.today()
     if not _is_completed_quarter(quarter, year, today):
@@ -466,7 +618,13 @@ async def fetch_transcript(
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=timeout_s)
     try:
-        return await _alpha_vantage_fetch(symbol, quarter, year, client=client, token=token)
+        try:
+            return await _fmp_fetch(symbol, quarter, year, client=client, token=token)
+        except FMPPlanError as e:
+            logger.warning(
+                "FMP transcript %s Q%d %d: plan/auth error — %s", symbol, quarter, year, e
+            )
+            return None
     finally:
         if owns_client:
             await client.aclose()
@@ -481,7 +639,7 @@ async def fetch_latest_transcript(
 ) -> Transcript | None:
     """Walk back from the most recent completed calendar quarter until we find
     a transcript. Returns None when nothing is available in the window or when
-    Alpha Vantage's quota is exhausted (logged once)."""
+    FMP's plan/auth gating fires (logged once, falls through to SEC EDGAR)."""
     today = today or _dt.date.today()
     q = (today.month - 1) // 3 + 1
     y = today.year
@@ -497,7 +655,7 @@ async def fetch_latest_transcript(
     neg_cache = _load_negative_cache()
     neg_cache_dirty = False
     api_calls_made = 0
-    av_quota_hit = False
+    fmp_plan_hit = False
     try:
         # `max_lookback_quarters` bounds the total quarters we walk back. Cached
         # empties consume a slot too — otherwise a polluted cache could make us
@@ -505,7 +663,7 @@ async def fetch_latest_transcript(
         for _ in range(max_lookback_quarters):
             if _is_cached_empty(neg_cache, symbol, q, y, today):
                 logger.debug(
-                    "AlphaVantage transcript %s Q%d %d: skipping (cached empty)", symbol, q, y
+                    "FMP transcript %s Q%d %d: skipping (cached empty)", symbol, q, y
                 )
                 q -= 1
                 if q == 0:
@@ -516,14 +674,14 @@ async def fetch_latest_transcript(
                 await asyncio.sleep(WALKBACK_REQUEST_DELAY_S)
             api_calls_made += 1
             try:
-                t = await _alpha_vantage_fetch(symbol, q, y, client=client, token=token)
-            except AlphaVantageQuotaError as e:
+                t = await _fmp_fetch(symbol, q, y, client=client, token=token)
+            except FMPPlanError as e:
                 logger.warning(
-                    "AlphaVantage transcript %s: quota / rate-limit hit on Q%d %d — "
+                    "FMP transcript %s: plan/auth error on Q%d %d — "
                     "falling back to SEC EDGAR. %s",
                     symbol, q, y, e,
                 )
-                av_quota_hit = True
+                fmp_plan_hit = True
                 break
             if t is not None:
                 return t
@@ -534,13 +692,13 @@ async def fetch_latest_transcript(
                 q = 4
                 y -= 1
 
-        # SEC EDGAR fallback: try once, regardless of whether AV exhausted via
-        # walk-back or via quota advisory. Free and rate-limit-free; coverage
-        # is partial so this often returns None too, but when it hits, it's
-        # complementary to AV.
+        # SEC EDGAR fallback: try once, regardless of whether FMP exhausted via
+        # walk-back or via plan-error advisory. Free and rate-limit-free;
+        # coverage is partial so this often returns None too, but when it hits
+        # it's complementary to FMP.
         logger.info(
-            "AlphaVantage transcript %s: %s, trying SEC EDGAR fallback",
-            symbol, "quota hit" if av_quota_hit else "no transcript in walk-back window",
+            "FMP transcript %s: %s, trying SEC EDGAR fallback",
+            symbol, "plan/auth error" if fmp_plan_hit else "no transcript in walk-back window",
         )
         sec_t = await _sec_extract_transcript(symbol, client=client, today=today)
         if sec_t is not None:

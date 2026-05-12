@@ -40,7 +40,7 @@ uv pip install -e ".[dev]"
                 ├─────────────────────────┤
                 │ • quarterly_results (Go)│  ← fundamentals, sector ETF + returns,
                 │                         │    earnings reactions, options, etc.
-                │ • Alpha Vantage         │  ← transcript (primary)
+                │ • FMP (paid endpoint)   │  ← transcript (primary)
                 │ • SEC EDGAR 8-K         │  ← transcript fallback
                 │ • Finnhub company-news  │  ← headlines
                 │ • SEC EDGAR (8-K)       │  ← 8-K material events
@@ -72,7 +72,7 @@ Pydantic model (`schemas.py`).
 | Agent | Inputs (sliced) | Output schema | Prompt |
 |---|---|---|---|
 | `fundamentals` | Full Go payload: revenue/EPS YoY, valuation ratios, peer medians, analyst PTs, beat history | `score, confidence, themes[≤5], reasoning` | `prompts/fundamentals.md` |
-| `transcript` | Latest earnings-call transcript text + (quarter, year) — Alpha Vantage primary (free tier: 25 req/day, 1 req/sec), SEC EDGAR 8-K exhibit fallback | `score, confidence, sentiment, guidance_direction, themes, management_tone, reasoning` | `prompts/transcript.md` |
+| `transcript` | Latest earnings-call source + (quarter, year) — `kind="transcript"` from FMP `/stable/earning-call-transcript` (paid tier) or SEC named-transcript exhibit; `kind="press_release"` from SEC EX-99.1 when no full transcript is published. Prompt caps confidence at 0.5 on `press_release` since it lacks Q&A tone. | `score, confidence, sentiment, guidance_direction, themes, management_tone, reasoning` | `prompts/transcript.md` |
 | `news` | Finnhub headlines (last 30d) + SEC 8-K material events | `score, confidence, material_dev_count, polarity, reasoning` | `prompts/news.md` |
 | `macro` | `earnings_date`, `macro_context` (FOMC/CPI/NFP near date), `sector_etf`, `sector_ret_1m`, `sector_ret_3m`, `currency` | `score, confidence, regime, sector_trend, reasoning` | `prompts/macro.md` |
 | `dynamic` | `current_price`, `ret_{1w,1m,6m,1y}`, `rsi14`, `hi_52`/`lo_52` and pct-from, `beat_rate`, `avg_beat_pct`, `implied_vs_hist_ratio`, `earnings_reactions[]` | `score, confidence, momentum, overbought_oversold, reasoning` | `prompts/dynamic.md` |
@@ -135,7 +135,7 @@ agents are stateless functions of (system_prompt, user_payload) → typed JSON.
 | Step | LLM? | Notes |
 |---|---|---|
 | Fetch fundamentals (`go run quarterly_results`) | No | Pure subprocess, ~5–60s per ticker |
-| Fetch transcript (Alpha Vantage → SEC EDGAR) | No | AV walk-back (25/day, 1s throttle, quota-bail). Disk-backed 7-day negative cache so re-runs skip known-empty quarters. On AV miss or quota: fall back to scanning recent 8-K Item 2.02 exhibits on EDGAR (free, no rate limit). EDGAR hit rate is low in practice (<10% for S&P 500 — most companies file only the press release, not prepared remarks) but it's harmless to try and costs ~2 HTTP calls per filing. |
+| Fetch transcript (FMP → SEC EDGAR full transcript → SEC EDGAR press release) | No | FMP walk-back against `/stable/earning-call-transcript` (the legacy `/api/v3` endpoint was deprecated 2025-08-31). Requires a paid FMP plan that includes the transcript endpoint; until plan covers it, every call returns HTTP 402 and the walk-back bails to EDGAR immediately. Disk-backed 7-day negative cache so re-runs skip known-empty quarters. On FMP miss / plan-gating: scan recent 8-K Item 2.02 exhibits on EDGAR — first looking for a transcript-shaped exhibit (~5-10% of S&P 500 attach one), then falling back to the press release (EX-99.1, ~100% of S&P 500 attach one) tagged `kind="press_release"`. The transcript agent's prompt recognizes this kind and caps confidence at 0.5 — press releases carry revenue/EPS/guidance signal but lack the Q&A tone that drives most of the agent's full-confidence work. |
 | Fetch news + 8-K events (Finnhub, SEC EDGAR) | No | Plain HTTP |
 | Each specialist agent (5 of them) | **Yes** | One LLM call per agent per ticker per cache miss |
 | Cache hit on any agent | No | SHA1 of `(ticker, agent, prompt_version, model, payload)` reads from disk |

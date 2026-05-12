@@ -21,9 +21,10 @@ async def analyze_transcript(
     cache: JsonCache | None = None,
 ) -> CompletionResult[TranscriptAnalysis]:
     body = transcript.content[:MAX_TRANSCRIPT_CHARS]
+    label = "Transcript" if transcript.kind == "transcript" else "Press Release"
     user = (
-        f"Symbol: {symbol}\nQuarter: {transcript.label}\n\n"
-        f"Transcript (truncated to {MAX_TRANSCRIPT_CHARS} chars):\n{body}"
+        f"Symbol: {symbol}\nQuarter: {transcript.label}\nInput kind: {transcript.kind}\n\n"
+        f"{label} (truncated to {MAX_TRANSCRIPT_CHARS} chars):\n{body}"
     )
     return await cached_complete(
         agent_name=AGENT_NAME,
@@ -31,8 +32,9 @@ async def analyze_transcript(
         payload={
             "quarter": transcript.quarter,
             "year": transcript.year,
+            "kind": transcript.kind,
             "content_len": len(transcript.content),
-            "content_hash_prefix": body[:200],  # plus content_len makes a stable key
+            "content_hash_prefix": body[:200],  # plus content_len + kind makes a stable key
         },
         user_prompt=user,
         schema=TranscriptAnalysis,
