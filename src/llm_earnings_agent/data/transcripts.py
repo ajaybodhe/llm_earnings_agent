@@ -1,94 +1,51 @@
 """Earnings call transcripts.
 
-Two-stage fallback chain:
+Single source: **SEC EDGAR earnings filings**. Free, no rate limit, ~100%
+coverage for any US-listed or ADR-listed company. We pull the most recent
+earnings filing — 8-K Item 2.02 for domestic filers, 6-K for foreign private
+issuers (NBIS, ASML, NVO, etc.) — and extract either:
 
-1. **Financial Modeling Prep** — primary. Paid endpoint.
-       https://financialmodelingprep.com/stable/earning-call-transcript?symbol=&quarter=&year=&apikey=
-       (The legacy /api/v3 endpoint was deprecated Aug 31, 2025 and now
-       returns a "Legacy Endpoint" error to non-grandfathered keys.)
-       Walk-back from the most recent completed calendar quarter up to
-       `max_lookback_quarters`, throttled to a polite ~0.25s between calls.
-       Negative results (HTTP 200 with empty array) are persisted to a disk
-       cache (`NEGATIVE_CACHE_PATH`) with a 7-day TTL so repeat runs don't
-       re-walk known-empty quarters.
+  • A transcript-shaped exhibit (Operator/speaker turns + Q&A markers — rare,
+    <10% of S&P 500 attach prepared remarks). Returned as `kind="transcript"`.
+  • The press release EX-99.1 otherwise. Returned as `kind="press_release"`.
+    The transcript agent's prompt recognises this kind and caps confidence
+    at 0.5 since Q&A and unscripted tone aren't observable.
 
-       Plan/auth errors (401/402/403 or "Error Message" body indicating
-       subscription gating) raise `FMPPlanError`, abort the walk-back, and
-       fall through to SEC EDGAR. The same key works once the FMP plan is
-       upgraded to include the transcript endpoint — no code change needed.
-
-2. **SEC EDGAR earnings filings** — fallback. Free, no rate limit. Accepts
-   both 8-K Item 2.02 (domestic filers) and 6-K (foreign private issuers).
-       Two-tier extraction within a single scan:
-         a. Look for transcript-shaped exhibits (long + multi-speaker + Q&A
-            markers — EX-99.2 / named-"transcript" / etc.). Empirically <10%
-            of S&P 500 attach prepared remarks; when present, returned as
-            `Transcript(kind="transcript")`.
-         b. If no transcript exhibit is found in the lookback window, return
-            the most recent earnings press release (EX-99.1 from the most
-            recent Item 2.02 8-K) as `Transcript(kind="press_release")`. The
-            transcript agent recognises this kind and caps confidence
-            accordingly — it has revenue/EPS/guidance text but no Q&A tone.
-       100% of S&P 500 attach a press release, so this gives the transcript
-       agent *some* signal for every ticker rather than null.
-
-History: Alpha Vantage (free 25/day) and API Ninjas / FMP-free were all
-tried and removed — quota too tight or endpoints behind paid gates anyway.
+History: Alpha Vantage (free 25/day, too tight), API Ninjas (400s on most US
+tickers), Financial Modeling Prep (legacy endpoint deprecated 2025-08-31, new
+endpoint requires $59/mo Ultimate plan) — all tried and removed. The SEC
+press-release path covers 100% of filers at $0 and degrades gracefully via
+the confidence cap.
 """
 
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
-
-TranscriptKind = Literal["transcript", "press_release"]
 
 import httpx
 
 from .events import SUBMISSIONS_URL, _resolve_cik, _user_agent
 
+TranscriptKind = Literal["transcript", "press_release"]
+
 logger = logging.getLogger(__name__)
 
-FMP_BASE_URL = "https://financialmodelingprep.com/stable/earning-call-transcript"
-FMP_DEFAULT_KEY = "vNrb9krkhGhldJ8Z1Ij21G5239wwsAUU"
-
-# SEC EDGAR archives use the bare integer CIK and the dashless accession in
-# the path. `index.json` lists files in the filing.
-SEC_FILING_INDEX_URL = (
-    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"  # unused, kept for reference
-)
 SEC_ARCHIVE_BASE = "https://www.sec.gov/Archives/edgar/data"
 # Maximum bytes to download for any single exhibit. SEC HTML exhibits are
 # normally <500KB but some PDFs / pictures can balloon.
 SEC_EXHIBIT_MAX_BYTES = 600_000
-# Look back this many days for an Item 2.02 8-K. Beyond a quarter, the
-# transcript is too stale to be a useful fallback.
+# Look back this many days for an earnings filing. Beyond a quarter, the
+# transcript is too stale to be a useful signal anyway.
 SEC_LOOKBACK_DAYS = 120
 # Heuristic thresholds for "this exhibit looks like a transcript, not just
 # the press release."
 SEC_TRANSCRIPT_MIN_CHARS = 8_000  # press releases are typically 3–6KB
 SEC_TRANSCRIPT_MIN_SPEAKERS = 3
-
-# FMP's paid tiers allow hundreds of req/min, but a small inter-call gap is
-# good citizenship and keeps the walk-back from hammering when a ticker has
-# many empty quarters in a row.
-WALKBACK_REQUEST_DELAY_S = 0.25
-
-# Disk-backed cache of (symbol, quarter, year) tuples that FMP has confirmed
-# empty. Walk-back skips any quarter in here, which avoids paying for repeat
-# negative lookups across runs. Entries expire after NEGATIVE_CACHE_TTL_DAYS
-# so a delayed-posting transcript can still be found.
-NEGATIVE_CACHE_PATH = (
-    Path(__file__).resolve().parents[3] / "data" / "cache" / "transcript_negative.json"
-)
-NEGATIVE_CACHE_TTL_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -97,22 +54,16 @@ class Transcript:
     quarter: int  # 1..4
     year: int
     content: str
-    # `transcript` = full prepared remarks + Q&A (AV, FMP, SEC named-transcript exhibit).
-    # `press_release` = SEC EX-99.1 fallback when no full transcript is available.
-    # Downstream prompt caps confidence on `press_release` since it lacks Q&A
-    # tone and analyst pushback that drive most of the agent's signal.
+    # `transcript` = full prepared remarks + Q&A (SEC named-transcript exhibit
+    # when a company attaches one — rare).
+    # `press_release` = SEC EX-99.1 — the default kind we return from the
+    # press-release-only path. Downstream prompt caps confidence on this kind
+    # since Q&A tone and analyst pushback aren't observable from a press release.
     kind: TranscriptKind = "transcript"
 
     @property
     def label(self) -> str:
         return f"Q{self.quarter} {self.year}"
-
-
-class FMPPlanError(RuntimeError):
-    """Raised when FMP returns a plan/auth error (401/402/403, or HTTP 200
-    with an "Error Message" body indicating subscription gating). Subsequent
-    calls in the same run will hit the same response, so callers should stop
-    walking back and surface the condition once."""
 
 
 def _quarter_end(quarter: int, year: int) -> _dt.date:
@@ -126,126 +77,6 @@ def _quarter_end(quarter: int, year: int) -> _dt.date:
 def _is_completed_quarter(quarter: int, year: int, today: _dt.date) -> bool:
     """True when the calendar quarter has fully ended on or before `today`."""
     return _quarter_end(quarter, year) <= today
-
-
-_FMP_PLAN_MSG_PAT = re.compile(
-    r"legacy|subscription|upgrade|restricted endpoint|premium|not available under",
-    re.IGNORECASE,
-)
-
-
-async def _fmp_fetch(
-    symbol: str, quarter: int, year: int, *, client: httpx.AsyncClient, token: str
-) -> Transcript | None:
-    """Fetch from FMP's `/stable/earning-call-transcript`. Response shape:
-        [{"symbol":"AMD","quarter":1,"year":2026,"date":"2026-05-05 17:00:00","content":"Operator..."}]
-
-    Raises `FMPPlanError` when the key/plan can't access the endpoint
-    (401/402/403, or HTTP 200 with an "Error Message" body) — the walk-back
-    should bail. Returns None for any other miss (no data for this quarter,
-    network error) so the walk-back can try an older quarter."""
-    params = {
-        "symbol": symbol.upper(),
-        "quarter": quarter,
-        "year": year,
-        "apikey": token,
-    }
-    try:
-        resp = await client.get(FMP_BASE_URL, params=params)
-        if resp.status_code in (401, 402, 403):
-            raise FMPPlanError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        payload = resp.json()
-    except FMPPlanError:
-        raise
-    except httpx.HTTPStatusError as e:
-        logger.warning(
-            "FMP transcript %s Q%d %d returned %d",
-            symbol, quarter, year, e.response.status_code,
-        )
-        return None
-    except httpx.HTTPError as e:
-        logger.warning(
-            "FMP transcript %s Q%d %d network error: %s", symbol, quarter, year, e
-        )
-        return None
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.warning(
-            "FMP transcript %s Q%d %d response was not valid JSON: %s", symbol, quarter, year, e
-        )
-        return None
-
-    # FMP sometimes returns 200 with a plan/auth error in the body rather than a 4xx.
-    if isinstance(payload, dict):
-        err = payload.get("Error Message") or payload.get("error") or ""
-        if isinstance(err, str) and _FMP_PLAN_MSG_PAT.search(err):
-            raise FMPPlanError(err)
-        return None
-    if not isinstance(payload, list) or not payload:
-        return None
-    entry = payload[0]
-    if not isinstance(entry, dict):
-        return None
-    content = (entry.get("content") or "").strip()
-    if not content:
-        return None
-    # Trust the entry's own quarter/year when present; fall back to the request params.
-    try:
-        q = int(entry.get("quarter", quarter))
-        y = int(entry.get("year", year))
-    except (TypeError, ValueError):
-        q, y = quarter, year
-    return Transcript(symbol=symbol.upper(), quarter=q, year=y, content=content)
-
-
-def _neg_cache_key(symbol: str, quarter: int, year: int) -> str:
-    return f"{symbol.upper()}:Q{quarter}:{year}"
-
-
-def _load_negative_cache() -> dict[str, str]:
-    if not NEGATIVE_CACHE_PATH.exists():
-        return {}
-    try:
-        data = json.loads(NEGATIVE_CACHE_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _save_negative_cache(cache: dict[str, str]) -> None:
-    NEGATIVE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = NEGATIVE_CACHE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache, indent=0, separators=(",", ":"), sort_keys=True))
-    tmp.replace(NEGATIVE_CACHE_PATH)
-
-
-def _is_cached_empty(
-    cache: dict[str, str], symbol: str, quarter: int, year: int, today: _dt.date
-) -> bool:
-    key = _neg_cache_key(symbol, quarter, year)
-    recorded_str = cache.get(key)
-    if not recorded_str:
-        return False
-    try:
-        recorded = _dt.date.fromisoformat(recorded_str)
-    except ValueError:
-        return False
-    return (today - recorded).days < NEGATIVE_CACHE_TTL_DAYS
-
-
-def _record_empty(
-    cache: dict[str, str], symbol: str, quarter: int, year: int, today: _dt.date
-) -> None:
-    cache[_neg_cache_key(symbol, quarter, year)] = today.isoformat()
-
-
-def _resolve_token() -> str:
-    token = os.environ.get("FMP_API_KEY", "") or FMP_DEFAULT_KEY
-    if not token:
-        raise RuntimeError("FMP_API_KEY env var must be set")
-    return token
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -337,13 +168,18 @@ def _earnings_quarter_for_filing(
 # "remarks"/"call" files are realistic transcript candidates.
 #
 # Exhibit-99 naming varies wildly across filers:
-#   • `ex-99.1.htm`, `ex991.htm`            ← standard
-#   • `a8-kex991q2202603282026.htm`         ← Apple-style, "ex99" glued mid-name
-#   • `q12026991.htm`                       ← AMD-style, no "ex" prefix at all
-# So the regex matches EITHER an explicit `ex99` token OR `99N` immediately
-# followed by a separator/extension (.htm, _, -). The trailing class avoids
-# spurious matches on years like 1999 inside random text.
-_EX99_PAT = re.compile(r"(?:ex[_\-]?99|99[12349](?:\.|[_\-]|$))", re.IGNORECASE)
+#   • `ex-99.1.htm`, `ex991.htm`              ← standard
+#   • `a8-kex991q2202603282026.htm`           ← Apple-style, "ex99" glued mid-name
+#   • `exhibit991pressrelease-q2f.htm`        ← Cisco-style, spelled-out "exhibit"
+#   • `q12026991.htm`                         ← AMD-style, no "ex" prefix at all
+# So the regex matches EITHER (a) an `ex` or `exhibit` token immediately
+# followed by `99`, OR (b) standalone `99N` preceded by a non-letter and
+# followed by a separator/extension. The lookbehind on (b) avoids matching
+# "99" embedded in words like "1999thAnnual".
+_EX99_PAT = re.compile(
+    r"(?:ex(?:hibit)?[_\-]?99|(?<![a-z])99[12349](?:\.|[_\-]|$))",
+    re.IGNORECASE,
+)
 _NAMED_TRANSCRIPT_PAT = re.compile(r"transcript|remarks|earningscall|call[_\-]?script", re.IGNORECASE)
 _JUNK_FILE_PAT = re.compile(
     r"(?:"
@@ -366,7 +202,8 @@ def _is_candidate_exhibit(name: str) -> bool:
 
 
 _EX991_PAT = re.compile(
-    r"(?:ex[_\-]?99[_\-.]?1\b|991(?:\.|[_\-]|$))", re.IGNORECASE
+    r"(?:ex(?:hibit)?[_\-]?99[_\-.]?1\b|(?<![a-z])991(?:\.|[_\-]|$))",
+    re.IGNORECASE,
 )
 
 
@@ -597,6 +434,29 @@ async def _sec_extract_transcript(
     return press_release_fallback
 
 
+async def fetch_latest_transcript(
+    symbol: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    today: _dt.date | None = None,
+) -> Transcript | None:
+    """Fetch the most recent earnings filing for `symbol` from SEC EDGAR.
+
+    Returns a `Transcript` with `kind="press_release"` from the latest 8-K
+    Item 2.02 (domestic filers) or earnings 6-K (foreign private issuers),
+    or `kind="transcript"` on the rare occasion a company attaches prepared
+    remarks as a separate exhibit. Returns `None` only when the symbol has
+    no qualifying filing in the last `SEC_LOOKBACK_DAYS` days."""
+    today = today or _dt.date.today()
+    owns_client = client is None
+    client = client or httpx.AsyncClient(timeout=30.0)
+    try:
+        return await _sec_extract_transcript(symbol, client=client, today=today)
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
 async def fetch_transcript(
     symbol: str,
     quarter: int,
@@ -606,106 +466,23 @@ async def fetch_transcript(
     timeout_s: float = 30.0,
     today: _dt.date | None = None,
 ) -> Transcript | None:
-    """Fetch a single quarter's transcript via FMP. Returns None if not available.
+    """Fetch the earnings filing for a specific quarter (used by backtest).
 
-    Future / in-progress quarters short-circuit to None — FMP has no
-    transcript for a quarter that hasn't ended yet."""
+    Returns the SEC press release for `(quarter, year)` if it falls inside
+    the standard lookback window. The `_sec_extract_transcript` scanner
+    always returns the *most recent* filing, so this function only yields
+    a hit when the latest filing's quarter happens to match the requested
+    one. For backtests that need older quarters, this returns `None`."""
     today = today or _dt.date.today()
     if not _is_completed_quarter(quarter, year, today):
         return None
-
-    token = _resolve_token()
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=timeout_s)
     try:
-        try:
-            return await _fmp_fetch(symbol, quarter, year, client=client, token=token)
-        except FMPPlanError as e:
-            logger.warning(
-                "FMP transcript %s Q%d %d: plan/auth error — %s", symbol, quarter, year, e
-            )
+        result = await _sec_extract_transcript(symbol, client=client, today=today)
+        if result is None:
             return None
+        return result if (result.quarter, result.year) == (quarter, year) else None
     finally:
-        if owns_client:
-            await client.aclose()
-
-
-async def fetch_latest_transcript(
-    symbol: str,
-    *,
-    client: httpx.AsyncClient | None = None,
-    max_lookback_quarters: int = 6,
-    today: _dt.date | None = None,
-) -> Transcript | None:
-    """Walk back from the most recent completed calendar quarter until we find
-    a transcript. Returns None when nothing is available in the window or when
-    FMP's plan/auth gating fires (logged once, falls through to SEC EDGAR)."""
-    today = today or _dt.date.today()
-    q = (today.month - 1) // 3 + 1
-    y = today.year
-    while not _is_completed_quarter(q, y, today):
-        q -= 1
-        if q == 0:
-            q = 4
-            y -= 1
-
-    token = _resolve_token()
-    owns_client = client is None
-    client = client or httpx.AsyncClient(timeout=30.0)
-    neg_cache = _load_negative_cache()
-    neg_cache_dirty = False
-    api_calls_made = 0
-    fmp_plan_hit = False
-    try:
-        # `max_lookback_quarters` bounds the total quarters we walk back. Cached
-        # empties consume a slot too — otherwise a polluted cache could make us
-        # walk back arbitrarily far looking for an uncached quarter.
-        for _ in range(max_lookback_quarters):
-            if _is_cached_empty(neg_cache, symbol, q, y, today):
-                logger.debug(
-                    "FMP transcript %s Q%d %d: skipping (cached empty)", symbol, q, y
-                )
-                q -= 1
-                if q == 0:
-                    q = 4
-                    y -= 1
-                continue
-            if api_calls_made > 0:
-                await asyncio.sleep(WALKBACK_REQUEST_DELAY_S)
-            api_calls_made += 1
-            try:
-                t = await _fmp_fetch(symbol, q, y, client=client, token=token)
-            except FMPPlanError as e:
-                logger.warning(
-                    "FMP transcript %s: plan/auth error on Q%d %d — "
-                    "falling back to SEC EDGAR. %s",
-                    symbol, q, y, e,
-                )
-                fmp_plan_hit = True
-                break
-            if t is not None:
-                return t
-            _record_empty(neg_cache, symbol, q, y, today)
-            neg_cache_dirty = True
-            q -= 1
-            if q == 0:
-                q = 4
-                y -= 1
-
-        # SEC EDGAR fallback: try once, regardless of whether FMP exhausted via
-        # walk-back or via plan-error advisory. Free and rate-limit-free;
-        # coverage is partial so this often returns None too, but when it hits
-        # it's complementary to FMP.
-        logger.info(
-            "FMP transcript %s: %s, trying SEC EDGAR fallback",
-            symbol, "plan/auth error" if fmp_plan_hit else "no transcript in walk-back window",
-        )
-        sec_t = await _sec_extract_transcript(symbol, client=client, today=today)
-        if sec_t is not None:
-            return sec_t
-        return None
-    finally:
-        if neg_cache_dirty:
-            _save_negative_cache(neg_cache)
         if owns_client:
             await client.aclose()

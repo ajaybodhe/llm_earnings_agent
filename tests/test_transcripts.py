@@ -1,5 +1,4 @@
-"""Tests for the transcripts module — focused on the negative cache + walk-back
-control flow that drives FMP's transcript endpoint, plus SEC EDGAR fallback."""
+"""Tests for the transcripts module — SEC EDGAR is now the single source."""
 
 from __future__ import annotations
 
@@ -10,131 +9,51 @@ import pytest
 from llm_earnings_agent.data import transcripts as tx
 
 
-@pytest.fixture
-def neg_cache_file(tmp_path, monkeypatch):
-    """Redirect NEGATIVE_CACHE_PATH to a tmp file so tests don't touch the
-    real data/cache directory."""
-    path = tmp_path / "transcript_negative.json"
-    monkeypatch.setattr(tx, "NEGATIVE_CACHE_PATH", path)
-    return path
-
-
-def test_is_cached_empty_within_ttl():
-    today = dt.date(2026, 5, 11)
-    recorded = today - dt.timedelta(days=tx.NEGATIVE_CACHE_TTL_DAYS - 1)
-    cache = {tx._neg_cache_key("MNDY", 1, 2026): recorded.isoformat()}
-    assert tx._is_cached_empty(cache, "MNDY", 1, 2026, today) is True
-
-
-def test_is_cached_empty_expired():
-    today = dt.date(2026, 5, 11)
-    recorded = today - dt.timedelta(days=tx.NEGATIVE_CACHE_TTL_DAYS)
-    cache = {tx._neg_cache_key("MNDY", 1, 2026): recorded.isoformat()}
-    assert tx._is_cached_empty(cache, "MNDY", 1, 2026, today) is False
-
-
-def test_is_cached_empty_missing():
-    today = dt.date(2026, 5, 11)
-    assert tx._is_cached_empty({}, "MNDY", 1, 2026, today) is False
-
-
-def test_record_and_persist(neg_cache_file):
-    today = dt.date(2026, 5, 11)
-    cache = {}
-    tx._record_empty(cache, "amd", 4, 2024, today)
-    tx._save_negative_cache(cache)
-    reloaded = tx._load_negative_cache()
-    assert reloaded == {"AMD:Q4:2024": "2026-05-11"}
-
-
-@pytest.fixture
-def mock_sec_none(monkeypatch):
-    """Stub the SEC fallback so unit tests don't make real network calls."""
-    async def fake(symbol, *, client, today):
-        return None
-    monkeypatch.setattr(tx, "_sec_extract_transcript", fake)
-
-
 @pytest.mark.asyncio
-async def test_walkback_uses_cache_and_bounds_total_quarters(
-    monkeypatch, neg_cache_file, mock_sec_none
-):
-    """A polluted negative cache should never cause the walk-back to exceed
-    `max_lookback_quarters` total quarter-slots — cached skips consume a slot
-    too. Otherwise a stale cache would silently extend the walk arbitrarily."""
-    today = dt.date(2026, 5, 11)
-    # Pre-populate the cache with the first 3 quarters FMP would try.
-    cache = {}
-    for q, y in [(1, 2026), (4, 2025), (3, 2025)]:
-        tx._record_empty(cache, "AMD", q, y, today)
-    tx._save_negative_cache(cache)
-
-    calls: list[tuple[str, int, int]] = []
-
-    async def fake_fmp_fetch(symbol, quarter, year, *, client, token):
-        calls.append((symbol, quarter, year))
-        return None  # always empty
-
-    monkeypatch.setattr(tx, "_fmp_fetch", fake_fmp_fetch)
-    monkeypatch.setattr(tx, "WALKBACK_REQUEST_DELAY_S", 0)
-
-    result = await tx.fetch_latest_transcript(
-        "AMD", max_lookback_quarters=6, today=today
+async def test_fetch_latest_transcript_returns_sec_result(monkeypatch):
+    """`fetch_latest_transcript` is now a thin wrapper around the SEC scanner."""
+    expected = tx.Transcript(
+        symbol="AMD", quarter=1, year=2026, content="x", kind="press_release"
     )
-
-    assert result is None
-    # 3 cached skips + 3 fresh API calls = 6 quarter-slots consumed.
-    assert calls == [("AMD", 2, 2025), ("AMD", 1, 2025), ("AMD", 4, 2024)]
-
-
-@pytest.mark.asyncio
-async def test_walkback_stops_on_plan_error_and_tries_sec(monkeypatch, neg_cache_file):
-    """A plan/auth error aborts the FMP walk-back, then SEC is tried once."""
-    today = dt.date(2026, 5, 11)
-    fmp_calls: list[tuple[str, int, int]] = []
-    sec_calls: list[str] = []
-
-    async def fake_fmp_fetch(symbol, quarter, year, *, client, token):
-        fmp_calls.append((symbol, quarter, year))
-        raise tx.FMPPlanError("HTTP 402: Restricted Endpoint")
-
-    async def fake_sec(symbol, *, client, today):
-        sec_calls.append(symbol)
-        return None
-
-    monkeypatch.setattr(tx, "_fmp_fetch", fake_fmp_fetch)
-    monkeypatch.setattr(tx, "_sec_extract_transcript", fake_sec)
-    monkeypatch.setattr(tx, "WALKBACK_REQUEST_DELAY_S", 0)
-
-    result = await tx.fetch_latest_transcript(
-        "AMD", max_lookback_quarters=6, today=today
-    )
-    assert result is None
-    assert len(fmp_calls) == 1  # exited after first plan error, didn't try Q4 etc.
-    assert sec_calls == ["AMD"]  # SEC fallback ran once
-
-
-@pytest.mark.asyncio
-async def test_sec_fallback_can_return_transcript(monkeypatch, neg_cache_file):
-    """When FMP is exhausted, a transcript-shaped SEC exhibit is returned."""
-    today = dt.date(2026, 5, 11)
-
-    async def fake_fmp_fetch(symbol, quarter, year, *, client, token):
-        return None  # FMP consistently empty
-
-    expected = tx.Transcript(symbol="AMD", quarter=1, year=2026, content="...")
 
     async def fake_sec(symbol, *, client, today):
         return expected
 
-    monkeypatch.setattr(tx, "_fmp_fetch", fake_fmp_fetch)
     monkeypatch.setattr(tx, "_sec_extract_transcript", fake_sec)
-    monkeypatch.setattr(tx, "WALKBACK_REQUEST_DELAY_S", 0)
-
-    result = await tx.fetch_latest_transcript(
-        "AMD", max_lookback_quarters=2, today=today
-    )
+    result = await tx.fetch_latest_transcript("AMD", today=dt.date(2026, 5, 13))
     assert result is expected
+
+
+@pytest.mark.asyncio
+async def test_fetch_latest_transcript_returns_none_when_sec_empty(monkeypatch):
+    async def fake_sec(symbol, *, client, today):
+        return None
+
+    monkeypatch.setattr(tx, "_sec_extract_transcript", fake_sec)
+    result = await tx.fetch_latest_transcript("XYZZY", today=dt.date(2026, 5, 13))
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_transcript_returns_only_matching_quarter(monkeypatch):
+    """`fetch_transcript(q, y)` (backtest path) only returns the SEC result
+    when its quarter happens to match the requested one."""
+    today = dt.date(2026, 5, 13)
+    sec_result = tx.Transcript(
+        symbol="AMD", quarter=1, year=2026, content="x", kind="press_release"
+    )
+
+    async def fake_sec(symbol, *, client, today):
+        return sec_result
+
+    monkeypatch.setattr(tx, "_sec_extract_transcript", fake_sec)
+
+    # Requested quarter matches → returns the result.
+    assert await tx.fetch_transcript("AMD", 1, 2026, today=today) is sec_result
+    # Requested older quarter → None (SEC scanner returns latest only).
+    assert await tx.fetch_transcript("AMD", 4, 2025, today=today) is None
+    # Future quarter → short-circuits before SEC is even called.
+    assert await tx.fetch_transcript("AMD", 3, 2026, today=today) is None
 
 
 def test_looks_like_transcript_press_release_rejected():
@@ -194,6 +113,8 @@ def test_is_candidate_exhibit_accepts_real_exhibits():
     assert tx._is_candidate_exhibit("prepared_remarks.txt") is True
     # AMD-style: exhibit 99.1 without the "ex" prefix.
     assert tx._is_candidate_exhibit("q12026991.htm") is True
+    # Cisco-style: "exhibit" spelled out + EX-99.1 content.
+    assert tx._is_candidate_exhibit("exhibit991pressrelease-q2f.htm") is True
 
 
 def test_exhibit_sort_key_orders_transcripts_first():
@@ -210,6 +131,14 @@ def test_exhibit_sort_key_biases_amd_style_press_release_last():
     names = ["q12026991.htm", "ex-99.2.htm"]
     names.sort(key=tx._exhibit_sort_key)
     assert names == ["ex-99.2.htm", "q12026991.htm"]
+
+
+def test_exhibit_sort_key_biases_cisco_style_press_release_last():
+    """Cisco's `exhibit991pressrelease-q2f.htm` must sort like a press
+    release (priority 2), not a generic candidate (priority 1)."""
+    names = ["exhibit991pressrelease-q2f.htm", "ex-99.2.htm"]
+    names.sort(key=tx._exhibit_sort_key)
+    assert names == ["ex-99.2.htm", "exhibit991pressrelease-q2f.htm"]
 
 
 def test_quarter_from_report_date():
