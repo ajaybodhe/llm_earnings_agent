@@ -148,8 +148,8 @@ def test_quarter_from_report_date():
 
 
 def test_earnings_quarter_8k_uses_report_date():
-    """8-K Item 2.02's reportDate is the fiscal period-end and should win
-    over the filing date even when the two are weeks apart."""
+    """A reportDate well before the filing date is a genuine period end and
+    wins over the filing date."""
     # Q1 2026 earnings filed 2026-05-01 with reportDate=2026-03-31 → Q1 2026.
     assert tx._earnings_quarter_for_filing(
         "8-K", dt.date(2026, 5, 1), "2026-03-31"
@@ -195,18 +195,17 @@ def test_earnings_indicator_rejects_short_text():
 
 
 def test_earnings_quarter_6k_back_dates_filing_for_foreign_filers():
-    """6-K reportDate equals the filing date — back-date 45d to land in the
-    quarter the earnings are actually reporting."""
+    """6-K reportDate equals the filing date — label the last quarter that
+    closed before the release."""
     # NBIS files Q1 2026 results on 2026-05-01 (reportDate=2026-05-01 same as filed).
-    # 2026-05-01 minus 45d = 2026-03-17 → Q1 2026.
     assert tx._earnings_quarter_for_filing(
         "6-K", dt.date(2026, 5, 1), "2026-05-01"
     ) == (1, 2026)
-    # Q4 2025 results filed early Feb 2026 → back-dated to mid-Dec 2025 → Q4 2025.
+    # Q4 2025 results filed early Feb 2026 → Q4 2025.
     assert tx._earnings_quarter_for_filing(
         "6-K", dt.date(2026, 2, 5), "2026-02-05"
     ) == (4, 2025)
-    # Q2 2026 results filed Aug 1 → back-dated to mid-June → Q2 2026.
+    # Q2 2026 results filed Aug 1 → Q2 2026.
     assert tx._earnings_quarter_for_filing(
         "6-K", dt.date(2026, 8, 1), "2026-08-01"
     ) == (2, 2026)
@@ -388,7 +387,7 @@ async def test_sec_returns_press_release_when_no_transcript_found(monkeypatch):
     result = await tx._sec_extract_transcript("AAPL", client=FakeClient(), today=today)
     assert result is not None
     assert result.kind == "press_release"
-    assert result.quarter == 2  # report_date 2026-04-29 → Q2 2026
+    assert result.quarter == 1  # released 2026-04-30 → reports Q1 2026 ("First Quarter")
     assert result.year == 2026
     assert "Acme Corp Reports" in result.content
 
@@ -445,3 +444,99 @@ async def test_sec_prefers_transcript_over_press_release_in_same_filing(monkeypa
     assert result is not None
     assert result.kind == "transcript"
     assert "Operator:" in result.content
+
+
+# ── exhibits without an exhibit-99 file name (e.g. Summit Therapeutics) ──────
+
+_SMMT_FILES = [
+    "0001599298-26-000067-index-headers.html",
+    "0001599298-26-000067-index.html",
+    "0001599298-26-000067.txt",
+    "0001599298-26-000067-xbrl.zip",
+    "a20260723q2earningsdeck_.htm",
+    "a20260723q2earningsdeck_001.jpg",
+    "a2026_prx0723xq22026earn.htm",
+    "a2026_prx0723xq22026earn001.jpg",
+    "FilingSummary.xml",
+    "R1.htm",
+    "smmt-20260723.htm",
+    "smmt-20260723.xsd",
+]
+
+
+def test_fallback_exhibits_prefers_press_release_over_deck():
+    assert not any(tx._is_candidate_exhibit(n) for n in _SMMT_FILES)
+    got = tx._fallback_exhibits(
+        _SMMT_FILES, primary="smmt-20260723.htm", accession="0001599298-26-000067"
+    )
+    assert got == ["a2026_prx0723xq22026earn.htm", "a20260723q2earningsdeck_.htm"]
+
+
+@pytest.mark.asyncio
+async def test_sec_scanner_uses_unnamed_exhibits(monkeypatch):
+    """An Item 2.02 filing whose exhibits carry no '99' in their names still
+    yields the press release instead of None."""
+    release = (
+        "Summit Therapeutics Reports Financial Results and Operational Progress "
+        "for the Second Quarter and Six Months Ended June 30, 2026. "
+    ) * 40
+    fetched: list[str] = []
+
+    async def fake_resolve_cik(symbol, client):
+        return "0001599298"
+
+    async def fake_index_fetch(cik, accession, *, client):
+        return [{"name": n} for n in _SMMT_FILES]
+
+    async def fake_exhibit_text(cik, accession, filename, *, client):
+        fetched.append(filename)
+        return release if "prx" in filename else "slides " * 500
+
+    class FakeClient:
+        async def get(self, url, *, headers=None):
+            class R:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {"filings": {"recent": {
+                        "form": ["8-K"],
+                        "filingDate": ["2026-07-23"],
+                        "items": ["2.02,7.01,9.01"],
+                        "accessionNumber": ["0001599298-26-000067"],
+                        "primaryDocument": ["smmt-20260723.htm"],
+                        "reportDate": ["2026-06-30"],
+                    }}}
+            return R()
+
+    monkeypatch.setattr(tx, "_resolve_cik", fake_resolve_cik)
+    monkeypatch.setattr(tx, "_sec_fetch_8k_index", fake_index_fetch)
+    monkeypatch.setattr(tx, "_sec_fetch_exhibit_text", fake_exhibit_text)
+
+    result = await tx._sec_extract_transcript(
+        "SMMT", client=FakeClient(), today=dt.date(2026, 10, 16)
+    )
+    assert result is not None
+    assert result.kind == "press_release"
+    assert (result.quarter, result.year) == (2, 2026)
+    assert "Summit Therapeutics Reports" in result.content
+    assert fetched[0] == "a2026_prx0723xq22026earn.htm"
+    assert "smmt-20260723.htm" not in fetched  # 8-K cover page is never a candidate
+
+
+def test_earnings_quarter_8k_report_date_is_event_date():
+    """SEC sets an earnings 8-K's reportDate to the announcement date (the
+    filing date), so the reported quarter is the last one that closed before
+    it — not the quarter containing the announcement."""
+    cases = [
+        (dt.date(2026, 7, 23), (2, 2026)),   # SMMT Q2 2026
+        (dt.date(2026, 7, 17), (2, 2026)),   # FITB Q2 2026
+        (dt.date(2026, 2, 23), (4, 2025)),   # late Q4 release: 45-day back-dating said Q1
+        (dt.date(2025, 10, 28), (3, 2025)),  # MSFT: reportDate a day before filing
+        (dt.date(2026, 1, 12), (4, 2025)),   # preliminary Q4 at JPM conference
+    ]
+    for filed, want in cases:
+        got = tx._earnings_quarter_for_filing("8-K", filed, filed.isoformat())
+        assert got == want, (filed, got)
+    # reportDate a day before filing (MSFT 2025-10-29 / 2025-10-28) is still an event date.
+    assert tx._earnings_quarter_for_filing("8-K", dt.date(2025, 10, 29), "2025-10-28") == (3, 2025)

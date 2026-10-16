@@ -138,23 +138,40 @@ def _quarter_from_report_date(report_date: _dt.date) -> tuple[int, int]:
     return q, report_date.year
 
 
+# Earnings releases land weeks after the quarter closes, never within days of
+# it, so a release reports the last quarter that ended at least this long
+# before the release date.
+_MIN_REPORT_LAG_DAYS = 10
+
+
+def _last_completed_quarter(event_date: _dt.date) -> tuple[int, int]:
+    """(quarter, year) of the last calendar quarter that ended at least
+    `_MIN_REPORT_LAG_DAYS` before `event_date`."""
+    d = event_date - _dt.timedelta(days=_MIN_REPORT_LAG_DAYS)
+    q = (d.month - 1) // 3 + 1
+    if d >= _quarter_end(q, d.year):
+        return q, d.year
+    return (q - 1, d.year) if q > 1 else (4, d.year - 1)
+
+
 def _earnings_quarter_for_filing(
     form_type: str, filed_date: _dt.date, report_date: str
 ) -> tuple[int, int]:
     """Resolve (quarter, year) for an earnings filing.
 
-    For 8-K Item 2.02, `reportDate` is the fiscal period-end (e.g. 2026-03-31
-    for a Q1 2026 release filed 2026-05-01) — use it directly.
-
-    For 6-K (foreign filers), SEC's `reportDate` is almost always equal to
-    the filing date rather than the period-end. Earnings releases typically
-    land 30-60 days after the quarter closes, so we subtract ~45 days from
-    the filing date to land back inside the reporting quarter. Without this,
-    a Q1 2026 NBIS release filed on 2026-05-01 would be labeled Q2 2026."""
-    if form_type == "6-K":
-        # Filing date back-dated 45 days to land in the reported quarter.
-        rep = filed_date - _dt.timedelta(days=45)
+    SEC's `reportDate` on an 8-K Item 2.02 or a 6-K is the date of the event —
+    the announcement itself, normally the filing date — not the fiscal period
+    end (e.g. Fifth Third's Q2 2026 release: filed and reportDate 2026-07-17).
+    The reported quarter is therefore the last one that closed before the
+    release: 2026-07-17 → Q2 2026, 2026-02-23 → Q4 2025. A `reportDate` that
+    does fall well before the filing is taken as a genuine period end."""
+    try:
+        rep = _dt.date.fromisoformat(report_date) if report_date else None
+    except ValueError:
+        rep = None
+    if rep is not None and rep <= filed_date - _dt.timedelta(days=_MIN_REPORT_LAG_DAYS):
         return _quarter_from_report_date(rep)
+    return _last_completed_quarter(rep or filed_date)
     try:
         rep = _dt.date.fromisoformat(report_date) if report_date else filed_date
     except ValueError:
@@ -218,6 +235,43 @@ def _exhibit_sort_key(name: str) -> tuple[int, str]:
     if _EX991_PAT.search(lower):
         return (2, lower)
     return (1, lower)
+
+
+# Some filers (often Workiva-generated, e.g. Summit Therapeutics) name their
+# exhibits without any "99" token — `a2026_prx0723xq22026earn.htm` is the
+# EX-99.1 press release and `a20260723q2earningsdeck_.htm` the EX-99.2 slides.
+# When no file in a filing matches _is_candidate_exhibit, every remaining
+# document becomes a candidate, ordered press-release-like names first and
+# decks/presentations last (slides carry less narrative than the release).
+_DECK_NAME_PAT = re.compile(r"deck|presentation|slides|investor", re.IGNORECASE)
+_PRESS_RELEASE_NAME_PAT = re.compile(
+    r"press|release|(?<![a-z])prx?(?![a-z])|earn", re.IGNORECASE
+)
+
+
+def _fallback_exhibits(names: list[str], *, primary: str, accession: str) -> list[str]:
+    """Candidate exhibits for a filing whose file names carry no exhibit-99
+    marker: every text document except the 8-K cover (primary document), the
+    full-submission ``{accession}.txt``, and EDGAR/XBRL boilerplate."""
+    skip = {primary.lower(), f"{accession}.txt".lower()}
+    out = [
+        n for n in names
+        if n.lower().endswith((".htm", ".html", ".txt"))
+        and n.lower() not in skip
+        and not _JUNK_FILE_PAT.search(n)
+    ]
+    return sorted(out, key=_fallback_sort_key)
+
+
+def _fallback_sort_key(name: str) -> tuple[int, str]:
+    lower = name.lower()
+    if _NAMED_TRANSCRIPT_PAT.search(lower):
+        return (0, lower)
+    if _DECK_NAME_PAT.search(lower):
+        return (3, lower)
+    if _PRESS_RELEASE_NAME_PAT.search(lower):
+        return (1, lower)
+    return (2, lower)
 
 
 async def _sec_fetch_8k_index(
@@ -376,22 +430,23 @@ async def _sec_extract_transcript(
     # encounter. Falls back to this when no transcript is found.
     press_release_fallback: Transcript | None = None
 
-    for filed_date, accession, _primary, report_date, form_type in candidates:
+    for filed_date, accession, primary_doc, report_date, form_type in candidates:
         if not accession:
             continue
         items = await _sec_fetch_8k_index(cik, accession, client=client)
         if not items:
             continue
-        exhibits = [
+        names = [
             it["name"] for it in items
-            if isinstance(it, dict)
-            and isinstance(it.get("name"), str)
-            and _is_candidate_exhibit(it["name"])
+            if isinstance(it, dict) and isinstance(it.get("name"), str)
         ]
+        exhibits = [n for n in names if _is_candidate_exhibit(n)]
         # Within the candidate pool, prefer files that name themselves as
         # transcript / remarks / call — those are the ones most likely to be
         # the actual transcript when a company attaches one.
         exhibits.sort(key=_exhibit_sort_key)
+        if not exhibits:
+            exhibits = _fallback_exhibits(names, primary=primary_doc, accession=accession)
         q, y = _earnings_quarter_for_filing(form_type, filed_date, report_date)
         for name in exhibits:
             text = await _sec_fetch_exhibit_text(cik, accession, name, client=client)
@@ -430,6 +485,12 @@ async def _sec_extract_transcript(
         logger.info(
             "SEC press-release fallback: %s Q%d %d (no full transcript found)",
             symbol, press_release_fallback.quarter, press_release_fallback.year,
+        )
+    elif candidates:
+        logger.warning(
+            "SEC: %s has %d earnings filing(s) in the last %d days but no usable "
+            "exhibit text; transcript agent will be skipped",
+            symbol, len(candidates), SEC_LOOKBACK_DAYS,
         )
     return press_release_fallback
 
