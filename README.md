@@ -25,6 +25,16 @@ uv pip install -e ".[dev]"
 # Force API runtime (requires ANTHROPIC_API_KEY)
 .venv/bin/llm-earnings-agent analyze --symbol AAPL --runtime api
 
+# Run a subset of agents (default: all). transcript and news never need
+# quarterly_results, so this skips the Go subprocess entirely.
+.venv/bin/llm-earnings-agent analyze --symbol AAPL --agents transcript,news
+
+# Supply the quarterly_results JSON yourself (file or '-' for stdin) instead of
+# letting the pipeline re-run the Go binary. This is how quarterly_results
+# calls us with `--llm-rating --llm-agents all`.
+(cd ../quarterly_results && go run . --symbol AAPL --output json) | \
+  .venv/bin/llm-earnings-agent analyze --symbol AAPL --payload -
+
 # Walk-forward backtest
 .venv/bin/llm-earnings-agent backtest --symbol AAPL --quarters 4
 ```
@@ -85,7 +95,7 @@ asks: *is the backdrop friendly or hostile for this specific stock right now?*
 
 - **Sector momentum** — the sector ETF's 1M and 3M return. Persistent positive
   ⇒ supportive; persistent negative ⇒ hostile. Sector ETF is mapped from the
-  company's SIC code by `quarterly_results/sector_momentum.go` (e.g. AAPL → XLK).
+  company's SIC code by `quarterly_results/internal/sector/momentum.go` (e.g. AAPL → XLK).
 - **Scheduled macro events** — FOMC / CPI / NFP / ECB / BoE within ±2 days of
   the earnings date. A hot CPI on the same week can drown out the earnings
   signal regardless of the print.
@@ -133,7 +143,7 @@ agents are stateless functions of (system_prompt, user_payload) → typed JSON.
 
 | Step | LLM? | Notes |
 |---|---|---|
-| Fetch fundamentals (`go run quarterly_results`) | No | Pure subprocess, ~5–60s per ticker |
+| Fetch fundamentals (`go run quarterly_results`) | No | Pure subprocess, ~5–60s per ticker. Skipped when `--payload` is given or no selected agent reads it (`fundamentals`, `macro`, `dynamic`) |
 | Fetch transcript (SEC EDGAR only) | No | Scan recent 8-K Item 2.02 (domestic filers) or 6-K (foreign filers, content-filtered to skip non-earnings 6-Ks like acquisitions / partnerships / governance) within the last 120 days. First look for a transcript-shaped exhibit (~5-10% of S&P 500 attach one); otherwise return the press release (EX-99.1, ~100% of filers) tagged `kind="press_release"`. The transcript agent's prompt recognizes this kind and caps confidence at 0.5 — press releases carry revenue/EPS/guidance signal but lack the Q&A tone that drives the agent's full-confidence work. |
 | Fetch news + 8-K events (Finnhub, SEC EDGAR) | No | Plain HTTP |
 | Each specialist agent (5 of them) | **Yes** | One LLM call per agent per ticker per cache miss |

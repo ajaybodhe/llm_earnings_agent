@@ -103,6 +103,8 @@ class Metadata(BaseModel):
     timestamp: datetime
     cost_estimate_usd: float = Field(ge=0.0)
     transcript_quarter: str | None = None
+    # Specialist agents requested for this run, in canonical order.
+    agents: list[str] = Field(default_factory=list)
 
 
 class AgentResponse(BaseModel):

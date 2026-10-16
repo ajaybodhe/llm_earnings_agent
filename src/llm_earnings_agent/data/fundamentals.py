@@ -64,24 +64,43 @@ async def fetch_fundamentals(
         msg = stderr.decode(errors="replace")[:1000]
         raise RuntimeError(f"quarterly_results exit {proc.returncode}: {msg}")
 
-    text = stdout.decode().strip()
+    return parse_payload(stdout.decode(), symbol)
+
+
+def parse_payload(text: str, symbol: str) -> FundamentalsPayload:
+    """Parse quarterly_results JSON output for one symbol.
+
+    Accepts either the CLI's JSON array (the element matching ``symbol`` is
+    picked, else the first) or a single result object — the form
+    quarterly_results sends on stdin with ``--payload -``.
+    """
+    text = text.strip()
     if not text:
         raise RuntimeError(f"quarterly_results produced no output for {symbol}")
 
-    # The CLI emits a JSON array of results. We expect exactly one when
-    # --symbol is used.
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
         # Some runs may include log noise before the JSON. Try to locate the
-        # first '[' and parse from there.
-        idx = text.find("[")
-        if idx < 0:
+        # first '[' or '{' and parse from there.
+        starts = [i for i in (text.find("["), text.find("{")) if i >= 0]
+        if not starts:
             raise
-        payload = json.loads(text[idx:])
+        payload = json.loads(text[min(starts):])
 
     if isinstance(payload, list):
         if not payload:
             raise RuntimeError(f"quarterly_results returned empty array for {symbol}")
-        return FundamentalsPayload(symbol=symbol.upper(), data=payload[0])
+        target = symbol.strip().upper()
+        match = next(
+            (
+                p
+                for p in payload
+                if isinstance(p, dict) and str(p.get("symbol", "")).upper() == target
+            ),
+            payload[0],
+        )
+        return FundamentalsPayload(symbol=symbol.upper(), data=match)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"quarterly_results payload for {symbol} is not a JSON object or array")
     return FundamentalsPayload(symbol=symbol.upper(), data=payload)

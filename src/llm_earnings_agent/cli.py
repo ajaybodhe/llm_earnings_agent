@@ -6,12 +6,14 @@ import asyncio
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from .cache import JsonCache
-from .pipeline import analyze_symbol
+from .data.fundamentals import parse_payload
+from .pipeline import analyze_symbol, parse_agents
 from .runtime.base import Runtime, auto_select_runtime
 
 app = typer.Typer(add_completion=False, help="LLM-agent earnings reaction analyzer.")
@@ -38,9 +40,32 @@ def analyze(
     no_cache: Annotated[bool, typer.Option("--no-cache", help="Disable filesystem cache")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
     use_llm_aggregator: Annotated[bool, typer.Option("--llm-aggregator", help="Run aggregator agent via LLM")] = False,
+    agents: Annotated[
+        str,
+        typer.Option(
+            "--agents",
+            help="Comma-separated subset of fundamentals,transcript,news,macro,dynamic, or 'all'",
+        ),
+    ] = "all",
+    payload: Annotated[
+        str | None,
+        typer.Option(
+            "--payload",
+            help="quarterly_results JSON for this symbol (file path, or '-' for stdin); "
+            "skips re-running the Go binary",
+        ),
+    ] = None,
 ) -> None:
     """Analyze a single ticker and emit JSON."""
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING, format="%(levelname)s %(message)s")
+    try:
+        selected = parse_agents(agents)
+    except ValueError as e:
+        raise typer.BadParameter(str(e), param_hint="--agents") from None
+    fundamentals_payload = None
+    if payload is not None:
+        text = sys.stdin.read() if payload == "-" else Path(payload).read_text(encoding="utf-8")
+        fundamentals_payload = parse_payload(text, symbol).data
     rt = _runtime_for(runtime)
     cache = None if no_cache else JsonCache()
 
@@ -51,6 +76,8 @@ def analyze(
             model=model,
             cache=cache,
             use_llm_aggregator=use_llm_aggregator,
+            agents=selected,
+            fundamentals_payload=fundamentals_payload,
         )
     )
 
