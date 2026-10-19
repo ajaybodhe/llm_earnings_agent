@@ -269,52 +269,6 @@ def pead_live(
         sys.stdout.write(report(history, [e for e in new if e["has_open"]]) + "\n")
 
 
-@pead_app.command("suetxt")
-def pead_suetxt(
-    events: Annotated[Path, typer.Option("--events", help="Event JSONL")],
-    data: Annotated[Path, typer.Option("--data", help="pead data dir (texts/, prices/)")] = Path(
-        "data/pead"
-    ),
-    refresh: Annotated[bool, typer.Option("--refresh", help="Re-estimate SUE.txt")] = False,
-    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
-) -> None:
-    """Replicate PEAD.txt (SUE.txt) on press releases and test drift + earnings-day use."""
-    logging.basicConfig(
-        level=logging.INFO if verbose else logging.WARNING, format="%(levelname)s %(message)s"
-    )
-    from .pead import suetxt
-    from .pead.context import add_context, fetch_daily
-    from .pead.events import load_events
-    from .pead.longdrift import add_long_drift
-    from .pead.suetxt_eval import combined_models, report
-    from .pead.text import text_path
-
-    evs = load_events(events)
-    spy = fetch_daily("SPY")
-    add_context(evs, spy, fetch_daily("^VIX"))
-    out = data / "sue_txt.jsonl"
-    if refresh or not out.exists():
-        spy_close = {d: c for d, (_, c) in spy.items()}
-        dates = sorted(spy_close)
-        texts, ar = {}, {}
-        for e in evs:
-            acc = e.get("accession")
-            if acc and text_path(data, acc).exists():
-                texts[e["event_id"]] = text_path(data, acc).read_text(encoding="utf-8")
-            a = suetxt.abnormal_reaction(e, spy_close, dates)
-            if a is not None:
-                ar[e["event_id"]] = a
-        sue = suetxt.rolling_sue_txt(evs, texts, ar, progress=lambda m: sys.stderr.write(m + "\n"))
-        suetxt.save(out, sue)
-    sue = suetxt.load(out)
-    for e in evs:
-        if e["event_id"] in sue:
-            e["features"]["sue_txt"] = sue[e["event_id"]]
-    add_long_drift(evs, data / "prices")
-    sys.stdout.write(f"{len(sue)} events with out-of-sample SUE.txt\n\n")
-    sys.stdout.write(report(evs) + "\n\n" + combined_models(evs) + "\n")
-
-
 @app.command()
 def bulk(
     runtime: Annotated[str | None, typer.Option("--runtime", help="api | claude-code")] = None,
