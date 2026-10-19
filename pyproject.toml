@@ -25,6 +25,13 @@ dev = [
     "ruff>=0.6",
     "inspect-ai>=0.3",
 ]
+# Post-earnings-drift research: local CPU text embeddings (ONNX, no torch —
+# runs on Intel Macs where current torch wheels don't).
+pead = [
+    "fastembed>=0.9",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",  # GBDT / ridge / PCA (LightGBM is used instead when it loads)
+]
 
 [project.scripts]
 llm-earnings-agent = "llm_earnings_agent.cli:app"

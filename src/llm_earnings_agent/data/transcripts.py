@@ -495,6 +495,39 @@ async def _sec_extract_transcript(
     return press_release_fallback
 
 
+def _press_release_sort_key(name: str) -> tuple[int, str]:
+    """Exhibit order when the press release itself is wanted: EX-99.1 first,
+    other exhibit-99s next, named transcripts last."""
+    lower = name.lower()
+    if _EX991_PAT.search(lower):
+        return (0, lower)
+    if _NAMED_TRANSCRIPT_PAT.search(lower):
+        return (2, lower)
+    return (1, lower)
+
+
+async def fetch_press_release_text(
+    cik: str | int, accession: str, primary_doc: str, *, client: httpx.AsyncClient
+) -> str | None:
+    """Return the earnings press release text attached to one Item 2.02 8-K
+    (normally EX-99.1), or None when the filing has no usable exhibit.
+
+    Used to build point-in-time text features for historical events, where the
+    accession is already known; the 8-K cover page itself is never returned."""
+    items = await _sec_fetch_8k_index(str(cik), accession, client=client)
+    if not items:
+        return None
+    names = [it["name"] for it in items if isinstance(it, dict) and isinstance(it.get("name"), str)]
+    exhibits = sorted((n for n in names if _is_candidate_exhibit(n)), key=_press_release_sort_key)
+    if not exhibits:
+        exhibits = _fallback_exhibits(names, primary=primary_doc, accession=accession)
+    for name in exhibits:
+        text = await _sec_fetch_exhibit_text(str(cik), accession, name, client=client)
+        if text and len(text) >= SEC_PRESS_RELEASE_MIN_CHARS:
+            return text
+    return None
+
+
 async def fetch_latest_transcript(
     symbol: str,
     *,

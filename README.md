@@ -39,6 +39,41 @@ uv pip install -e ".[dev]"
 .venv/bin/llm-earnings-agent backtest --symbol AAPL --quarters 4
 ```
 
+## Post-earnings drift research (`pead`)
+
+Text features for the point-in-time event dataset built by quarterly_results
+(`go run . --build-dataset data/events_10y.jsonl …`). No LLM is used on
+historical text — a model may remember how past quarters played out.
+
+```bash
+uv pip install -e ".[pead]"     # fastembed + ONNX Runtime (CPU, no torch)
+
+# Fetch each event's EX-99.1 press release from SEC (rate-limited, cached,
+# resumable), then write text_features.jsonl + embeddings.npy to --out.
+.venv/bin/llm-earnings-agent pead text \
+  --events ../quarterly_results/data/events_10y.jsonl --out data/pead
+
+# Optional Loughran-McDonald tone proportions. The dictionary is free for
+# academic research; commercial use needs a licence from the authors:
+# https://sraf.nd.edu/loughranmcdonald-master-dictionary/
+.venv/bin/llm-earnings-agent pead text --events … --out data/pead \
+  --lm-dictionary Loughran-McDonald_MasterDictionary.csv
+```
+
+Research and live commands (event history from quarterly_results):
+
+```bash
+.venv/bin/llm-earnings-agent pead gate  --events EVENTS   # quarterly IC / decile tests of simple signals
+.venv/bin/llm-earnings-agent pead model --events EVENTS   # walk-forward GBDT/ridge per task (--model ridge, --text data/pead)
+.venv/bin/llm-earnings-agent pead live  --events EVENTS --payload results.json   # Signal 1 / Signal 2 (-o json)
+```
+
+`quarterly_results --post-release` calls `pead live` itself; see its README for how to read the signals.
+
+Embeddings: `BAAI/bge-small-en-v1.5` (384-d) over the first 8 × 300-word
+chunks of each release, mean-pooled and L2-normalised; rows of
+`embeddings.npy` align with `embeddings_index.json` → `event_ids`.
+
 ## Architecture
 
 ### High level

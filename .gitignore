@@ -21,6 +21,8 @@ env/
 
 # Cache
 data/cache/
+# PEAD research data (press-release texts, embeddings)
+data/pead/
 *.log
 
 # IDE
