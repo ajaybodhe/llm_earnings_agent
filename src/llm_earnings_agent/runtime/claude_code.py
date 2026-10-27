@@ -17,12 +17,38 @@ from .base import CompletionResult, CompletionUsage, T
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 SUBPROCESS_TIMEOUT_S = 120
+WEB_TIMEOUT_S = 420  # searching and reading pages takes several turns
 
 
 def _strip_code_fences(text: str) -> str:
     """Pull JSON out of a ```json fenced block if the model wrapped it."""
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     return m.group(1) if m else text.strip()
+
+
+def parse_json_object(text: str) -> Any:
+    """The JSON object in a model reply: the whole reply, a fenced block, or
+    else the last top-level {...} (web-search replies can add prose first)."""
+    text = _strip_code_fences(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    dec = json.JSONDecoder()
+    last = None
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find("{", i + 1)
+            continue
+        if isinstance(obj, dict):
+            last = obj
+        i = text.find("{", end)
+    if last is None:
+        raise ValueError(f"no JSON object in model reply: {text[:200]!r}")
+    return last
 
 
 def _build_prompt(system: str, user: str, schema_json: dict[str, Any]) -> str:
@@ -57,6 +83,7 @@ class ClaudeCodeRuntime:
         user: str,
         schema: type[T],
         model: str | None = None,
+        web_search: bool = False,
     ) -> CompletionResult[T]:
         chosen_model = model or self.default_model
         schema_json = schema.model_json_schema()
@@ -71,16 +98,20 @@ class ClaudeCodeRuntime:
             "--model",
             chosen_model,
         ]
+        timeout = self.timeout_s
+        if web_search:
+            args += ["--allowedTools", "WebSearch,WebFetch"]
+            timeout = max(timeout, WEB_TIMEOUT_S)
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_s)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
             proc.kill()
-            raise RuntimeError(f"claude -p timed out after {self.timeout_s}s") from None
+            raise RuntimeError(f"claude -p timed out after {timeout}s") from None
 
         if proc.returncode != 0:
             raise RuntimeError(
@@ -92,7 +123,7 @@ class ClaudeCodeRuntime:
         if not text:
             raise RuntimeError(f"empty result from claude -p; envelope keys={list(envelope)}")
 
-        payload = json.loads(_strip_code_fences(text))
+        payload = parse_json_object(text)
         value = schema.model_validate(payload)
 
         # Claude Code's JSON envelope sometimes includes token counts in

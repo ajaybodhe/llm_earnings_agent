@@ -245,8 +245,19 @@ def pead_live(
         ),
     ],
     output: Annotated[str, typer.Option("--output", "-o", help="table | json")] = "table",
+    web: Annotated[
+        bool,
+        typer.Option(
+            "--web",
+            help="When the calendar has no surprise yet, read it (and guidance) from the web "
+            "with an LLM + web search; cached under --web-cache",
+        ),
+    ] = False,
+    web_cache: Annotated[Path, typer.Option("--web-cache")] = Path("data/pead/web"),
+    runtime: Annotated[str | None, typer.Option("--runtime", help="api | claude-code")] = None,
 ) -> None:
     """Signal 1 (at the release) and Signal 2 (at the open) for recent releases."""
+    import datetime as _dt
     import json as _json
 
     from .pead.context import add_context, fetch_daily
@@ -255,7 +266,20 @@ def pead_live(
 
     history = load_events(events)
     raw = sys.stdin.read() if str(payload) == "-" else payload.read_text(encoding="utf-8")
-    new = events_from_results(_json.loads(raw))
+    results = _json.loads(raw)
+    found = {}
+    if web:
+        from zoneinfo import ZoneInfo
+
+        from .pead.webearnings import fetch_all
+
+        today = _dt.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        found = fetch_all(_runtime_for(runtime), results, today, cache_dir=web_cache)
+        for sym, w in found.items():
+            ok, why = w.usable()
+            msg = f"surprise {w.surprise_pct():+.2f}% ({w.consensus_source})" if ok else why
+            sys.stderr.write(f"web backup {sym}: {msg}\n")
+    new = events_from_results(results, found)
     if not new:
         if output == "json":
             sys.stdout.write("[]\n")
@@ -267,6 +291,40 @@ def pead_live(
         sys.stdout.write(_json.dumps(signals(history, new)) + "\n")
     else:
         sys.stdout.write(report(history, [e for e in new if e["has_open"]]) + "\n")
+
+
+@pead_app.command("web-earnings")
+def pead_web_earnings(
+    symbol: Annotated[str, typer.Option("--symbol")],
+    date: Annotated[str, typer.Option("--date", help="Report date, YYYY-MM-DD")],
+    quarter: Annotated[
+        str, typer.Option("--quarter", help="Fiscal quarter end, e.g. Sep/2026")
+    ] = "",
+    company: Annotated[str, typer.Option("--company")] = "",
+    web_cache: Annotated[Path, typer.Option("--web-cache")] = Path("data/pead/web"),
+    refresh: Annotated[bool, typer.Option("--refresh")] = False,
+    runtime: Annotated[str | None, typer.Option("--runtime", help="api | claude-code")] = None,
+) -> None:
+    """Reported EPS vs consensus, revenue and guidance for one release, from the web."""
+    import json as _json
+
+    from .pead.webearnings import fetch, summary
+
+    w = asyncio.run(
+        fetch(
+            _runtime_for(runtime),
+            symbol.upper(),
+            company or symbol.upper(),
+            date,
+            quarter,
+            cache_dir=web_cache,
+            refresh=refresh,
+        )
+    )
+    if w is None:
+        sys.stderr.write("no result (see warnings)\n")
+        raise typer.Exit(1)
+    sys.stdout.write(_json.dumps(summary(w), indent=2) + "\n")
 
 
 @app.command()

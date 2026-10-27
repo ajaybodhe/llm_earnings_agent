@@ -28,6 +28,8 @@ from typing import Any
 import numpy as np
 
 from .model import _intraday_mkt, _open_to_close, make_model
+from .webearnings import WebEarnings
+from .webearnings import summary as web_summary
 
 CONSENSUS_START = "2021-01-01"
 CALIB_START = "2025-07-01"
@@ -49,31 +51,41 @@ _CLIP = {"eps_surprise_pct": 100.0, "gap_vs_typical": 10.0, "gap_x_surprise": 30
 SURPRISE_BINS = (-math.inf, -10.0, -2.0, 0.0, 2.0, 5.0, 10.0, 20.0, math.inf)
 
 
-def events_from_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def events_from_results(
+    results: list[dict[str, Any]], web: dict[str, WebEarnings] | None = None
+) -> list[dict[str, Any]]:
     """Turn quarterly_results JSON results into event dicts for released reports.
 
     A result qualifies once its consensus surprise is known (top-level
-    eps_surprise_pct, from the Nasdaq calendar). drift_features — present once
+    eps_surprise_pct, from the Nasdaq calendar), or — when `web` has a usable
+    entry for the symbol — from the web backup. drift_features — present once
     the reaction-day open exists — add the gap and momentum Signal 2 needs."""
     out = []
     for r in results:
         f = r.get("drift_features") or {}
         surprise = f.get("eps_surprise_pct", r.get("eps_surprise_pct"))
+        source = "nasdaq"
+        w = (web or {}).get(r["symbol"].upper())
+        if surprise is None and w is not None and w.usable()[0]:
+            surprise = w.surprise_pct()
+            source = f"web ({w.consensus_source or 'consensus'})"
         if surprise is None:
             continue
         feats = dict(f) if f else {"announcement_date": r.get("earnings_date", "")}
         feats["eps_surprise_pct"] = surprise
-        out.append(
-            {
-                "event_id": f"{r['symbol'].upper()}|{feats['announcement_date']}|live",
-                "symbol": r["symbol"],
-                "live": True,
-                "has_open": bool(f),
-                "earnings_time": r.get("earnings_time") or "",
-                "features": feats,
-                "labels": {},
-            }
-        )
+        e = {
+            "event_id": f"{r['symbol'].upper()}|{feats['announcement_date']}|live",
+            "symbol": r["symbol"],
+            "live": True,
+            "has_open": bool(f),
+            "earnings_time": r.get("earnings_time") or "",
+            "surprise_source": source,
+            "features": feats,
+            "labels": {},
+        }
+        if w is not None:
+            e["web"] = web_summary(w)
+        out.append(e)
     return out
 
 
@@ -197,7 +209,10 @@ def signals(history: list[dict[str, Any]], new: list[dict[str, Any]]) -> list[di
                 "n": b.n,
                 "mean_reaction_pct": b.mean_rx,
                 "label": signal1_label(b.p_up),
+                "surprise_source": e.get("surprise_source", "nasdaq"),
             }
+        if e.get("web"):
+            item["web"] = e["web"]
         if e.get("has_open", True) and f.get("gap_ret_pct") is not None:
             p = float(model.predict(np.asarray([_row(e)], dtype=float))[0])
             d = int(np.searchsorted(dec.edges, p, side="right"))

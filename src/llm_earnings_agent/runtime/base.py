@@ -43,7 +43,11 @@ class Runtime(Protocol):
         user: str,
         schema: type[T],
         model: str | None = None,
-    ) -> CompletionResult[T]: ...
+        web_search: bool = False,
+    ) -> CompletionResult[T]:
+        """web_search=True lets the model search and read web pages before
+        answering (Claude Code: WebSearch/WebFetch; API: the web_search tool)."""
+        ...
 
 
 def auto_select_runtime() -> Runtime:

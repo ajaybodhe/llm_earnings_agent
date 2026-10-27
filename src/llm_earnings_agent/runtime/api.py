@@ -9,11 +9,10 @@ mirrors how `claude_code.py` works.
 
 from __future__ import annotations
 
-import json
 import os
 
 from .base import CompletionResult, CompletionUsage, T
-from .claude_code import _build_prompt, _strip_code_fences
+from .claude_code import _build_prompt, parse_json_object
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 
@@ -56,23 +55,28 @@ class AnthropicAPIRuntime:
         user: str,
         schema: type[T],
         model: str | None = None,
+        web_search: bool = False,
     ) -> CompletionResult[T]:
         chosen_model = model or self.default_model
         schema_json = schema.model_json_schema()
         user_prompt = _build_prompt("", user, schema_json)
 
+        extra = {}
+        if web_search:
+            extra["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]
         msg = await self._client.messages.create(
             model=chosen_model,
-            max_tokens=self.max_tokens,
+            max_tokens=max(self.max_tokens, 4096) if web_search else self.max_tokens,
             system=system,
             messages=[{"role": "user", "content": user_prompt}],
+            **extra,
         )
 
         text = "".join(block.text for block in msg.content if block.type == "text")
         if not text:
             raise RuntimeError("empty response from Anthropic API")
 
-        payload = json.loads(_strip_code_fences(text))
+        payload = parse_json_object(text)
         value = schema.model_validate(payload)
 
         usage = CompletionUsage(

@@ -66,6 +66,7 @@ Research and live commands (event history from quarterly_results):
 .venv/bin/llm-earnings-agent pead gate  --events EVENTS   # quarterly IC / decile tests of simple signals
 .venv/bin/llm-earnings-agent pead model --events EVENTS   # walk-forward GBDT/ridge per task (--model ridge, --text data/pead)
 .venv/bin/llm-earnings-agent pead live  --events EVENTS --payload results.json   # Signal 1 / Signal 2 (-o json)
+.venv/bin/llm-earnings-agent pead web-earnings --symbol CDNS --date 2026-10-26 --quarter Sep/2026  # web backup: surprise + guidance
 ```
 
 `quarterly_results --post-release` calls `pead live` itself; see its README for how to read the signals.
